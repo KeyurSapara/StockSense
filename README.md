@@ -9,7 +9,6 @@ A simple, good-looking stock prediction app. Pick a stock, choose 7/14/30 days, 
 - 💾 **CSV export** of the forecast and the backtest
 
 Works with any Yahoo Finance symbol: `AAPL`, `TSLA`, `RELIANCE.NS`, `TCS.NS`, `BTC-USD` …
-
 ## Run it
 
 ```bash
