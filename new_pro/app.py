@@ -1,4 +1,4 @@
-"""StockSense — a friendly AI stock forecaster.  Run:  streamlit run app.py"""
+"""StockSense — LSTM vs linear regression stock forecaster.  Run:  streamlit run app.py"""
 
 import time
 
@@ -10,14 +10,15 @@ import streamlit as st
 
 import predictor
 
-st.set_page_config(page_title="StockSense · AI Stock Forecaster", page_icon="🔮", layout="wide")
+st.set_page_config(page_title="StockSense · Stock Forecaster", layout="wide")
 
-UP, DOWN, ACCENT, MUTED = "#22C55E", "#EF4444", "#7C5CFF", "#8B93A7"
-REG = "#F59E0B"  # colour for the regression model
-MODELS = {"lstm": ("🧠 LSTM", ACCENT), "regression": ("📐 Linear regression", REG)}
+UP, DOWN, ACCENT, MUTED = "#16A34A", "#DC2626", "#2563EB", "#6B7280"
+REG = "#D97706"  # colour for the regression model
+INK = "#111827"  # actual / close price lines
+MODELS = {"lstm": ("LSTM", ACCENT), "regression": ("Linear regression", REG)}
 POPULAR = {
-    "🍎 Apple": "AAPL", "⚡ Tesla": "TSLA", "🟩 NVIDIA": "NVDA", "🔎 Google": "GOOGL",
-    "🏭 Reliance": "RELIANCE.NS", "💻 TCS": "TCS.NS", "🏦 HDFC Bank": "HDFCBANK.NS", "₿ Bitcoin": "BTC-USD",
+    "Apple": "AAPL", "Tesla": "TSLA", "NVIDIA": "NVDA", "Google": "GOOGL",
+    "Reliance": "RELIANCE.NS", "TCS": "TCS.NS", "HDFC Bank": "HDFCBANK.NS", "Bitcoin": "BTC-USD",
 }
 CURRENCY = {"USD": "$", "INR": "₹", "EUR": "€", "GBP": "£", "JPY": "¥"}
 
@@ -25,16 +26,14 @@ st.markdown(
     """
 <style>
 .block-container {padding-top: 2rem; max-width: 1200px;}
-.hero h1 {font-size: 2.6rem; font-weight: 800; margin: 0;
-  background: linear-gradient(90deg,#7C5CFF,#22D3EE); -webkit-background-clip: text; color: transparent;}
-.hero p {color:#8B93A7; margin-top:.2rem; font-size:1.05rem;}
-.card {background:#151A28; border:1px solid #232A3D; border-radius:16px; padding:18px 20px; height:100%;}
-.card .label {color:#8B93A7; font-size:.8rem; text-transform:uppercase; letter-spacing:.06em;}
-.card .value {font-size:1.7rem; font-weight:700; margin-top:4px;}
-.card .sub {font-size:.9rem; margin-top:2px; color:#8B93A7;}
-.signal {border-radius:16px; padding:18px 22px; margin:8px 0 18px; font-size:1.05rem;}
+.hero h1 {font-size: 2rem; font-weight: 700; margin: 0; color:#111827;}
+.hero p {color:#6B7280; margin-top:.2rem; font-size:1rem;}
+.card {background:#FFFFFF; border:1px solid #E5E7EB; border-radius:8px; padding:14px 16px; height:100%;}
+.card .label {color:#6B7280; font-size:.8rem;}
+.card .value {font-size:1.5rem; font-weight:600; margin-top:4px; color:#111827;}
+.card .sub {font-size:.85rem; margin-top:2px; color:#6B7280;}
+.signal {border-radius:8px; padding:12px 16px; margin:8px 0 16px; font-size:1rem;}
 .disclaimer {color:#6B7280; font-size:.8rem; text-align:center; margin-top:2rem;}
-div.stButton > button {border-radius:999px;}
 </style>
 """,
     unsafe_allow_html=True,
@@ -96,12 +95,12 @@ def card(label, value, sub="", color=None):
 
 def base_layout(fig, height=480):
     fig.update_layout(
-        height=height, template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        height=height, template="plotly_white", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
         margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified",
         legend=dict(orientation="h", y=1.08, x=0), xaxis_rangeslider_visible=False,
     )
-    fig.update_xaxes(gridcolor="#1E2435")
-    fig.update_yaxes(gridcolor="#1E2435")
+    fig.update_xaxes(gridcolor="#E5E7EB")
+    fig.update_yaxes(gridcolor="#E5E7EB")
     return fig
 
 
@@ -109,8 +108,8 @@ def base_layout(fig, height=480):
 # Header + input
 # ---------------------------------------------------------------------------
 
-st.markdown('<div class="hero"><h1>🔮 StockSense</h1>'
-            '<p>Pick a stock and see where an AI model thinks it is heading.</p></div>',
+st.markdown('<div class="hero"><h1>StockSense</h1>'
+            '<p>Stock price forecasting with an LSTM and a linear regression model.</p></div>',
             unsafe_allow_html=True)
 
 if "ticker" not in st.session_state:
@@ -129,7 +128,7 @@ horizon = c2.select_slider("Forecast horizon", options=[7, 14, 30], value=14,
                            format_func=lambda d: f"{d} days")
 model_key = c3.radio("Headline model", list(MODELS), format_func=lambda k: MODELS[k][0], horizontal=True,
                      help="Both models are always trained. This picks which one drives the cards and forecast chart. "
-                          "See the ⚖️ tab for a head-to-head.")
+                          "See the LSTM vs Regression tab for a head-to-head.")
 ticker = typed.strip().upper()
 st.session_state.ticker = ticker
 
@@ -146,7 +145,7 @@ info = get_info(ticker)
 cur = CURRENCY.get(info["currency"], info["currency"] + " " if info["currency"] else "")
 bar = st.empty()
 res_lstm = get_forecast(ticker, horizon,
-                        progress=lambda f: bar.progress(f, text=f"🧠 Training the neural network… {int(f * 100)}%"))
+                        progress=lambda f: bar.progress(f, text=f"Training the LSTM… {int(f * 100)}%"))
 bar.empty()
 res_reg = get_regression(ticker, horizon)
 res = res_lstm if model_key == "lstm" else res_reg
@@ -182,23 +181,23 @@ k[3].markdown(card("Direction hit-rate", f"{m[f'direction_acc_{horizon}d']:.0f}%
 
 band = (hi - lo) / 2 / last * 100
 if abs(exp_chg) < band * 0.25:
-    mood, color, msg = "😐 Neutral", MUTED, "The predicted move is small compared to the uncertainty — no clear direction."
+    mood, color, msg = "Neutral", MUTED, "The predicted move is small compared to the uncertainty — no clear direction."
 elif exp_chg > 0:
-    mood, color, msg = "🐂 Leaning bullish", UP, f"The {MODEL_NAME} model expects a rise of about {exp_chg:.1f}% over {horizon} days."
+    mood, color, msg = "Leaning up", UP, f"The {MODEL_NAME} model expects a rise of about {exp_chg:.1f}% over {horizon} days."
 else:
-    mood, color, msg = "🐻 Leaning bearish", DOWN, f"The {MODEL_NAME} model expects a drop of about {abs(exp_chg):.1f}% over {horizon} days."
+    mood, color, msg = "Leaning down", DOWN, f"The {MODEL_NAME} model expects a drop of about {abs(exp_chg):.1f}% over {horizon} days."
 st.markdown(f'<div class="signal" style="background:{color}1A;border:1px solid {color}55">'
             f'<b style="color:{color}">{mood}</b> &nbsp;—&nbsp; {msg}</div>', unsafe_allow_html=True)
 other_chg = (float(other.future["pred"].iloc[-1]) / last - 1) * 100
 if np.sign(other_chg) != np.sign(exp_chg):
-    st.caption(f"⚠️ The {OTHER_NAME} model disagrees on direction ({other_chg:+.1f}%). See the ⚖️ tab.")
+    st.caption(f"Note: the {OTHER_NAME} model disagrees on direction ({other_chg:+.1f}%). See the LSTM vs Regression tab.")
 
 # ---------------------------------------------------------------------------
 # Tabs
 # ---------------------------------------------------------------------------
 
 tab_fc, tab_ind, tab_model, tab_cmp, tab_data = st.tabs(
-    ["📈 Forecast", "📊 Indicators", "🧪 How good is the model?", "⚖️ LSTM vs Regression", "💾 Data"])
+    ["Forecast", "Indicators", "Model accuracy", "LSTM vs Regression", "Data"])
 
 with tab_fc:
     r1, r2 = st.columns([3, 2])
@@ -229,11 +228,11 @@ with tab_ind:
     h = res.history.tail(252)
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3], vertical_spacing=0.04)
     fig.add_scatter(x=h.index, y=h["BB_up"], line=dict(width=0), showlegend=False, hoverinfo="skip", row=1, col=1)
-    fig.add_scatter(x=h.index, y=h["BB_low"], fill="tonexty", fillcolor="rgba(34,211,238,0.08)",
+    fig.add_scatter(x=h.index, y=h["BB_low"], fill="tonexty", fillcolor="rgba(37,99,235,0.08)",
                     line=dict(width=0), name="Bollinger band", row=1, col=1)
-    fig.add_scatter(x=h.index, y=h["Close"], line=dict(color="#E6E8F0", width=2), name="Close", row=1, col=1)
-    fig.add_scatter(x=h.index, y=h["MA20"], line=dict(color="#22D3EE", width=1.5), name="20-day avg", row=1, col=1)
-    fig.add_scatter(x=h.index, y=h["MA50"], line=dict(color="#F59E0B", width=1.5), name="50-day avg", row=1, col=1)
+    fig.add_scatter(x=h.index, y=h["Close"], line=dict(color=INK, width=2), name="Close", row=1, col=1)
+    fig.add_scatter(x=h.index, y=h["MA20"], line=dict(color="#0891B2", width=1.5), name="20-day avg", row=1, col=1)
+    fig.add_scatter(x=h.index, y=h["MA50"], line=dict(color=REG, width=1.5), name="50-day avg", row=1, col=1)
     fig.add_scatter(x=h.index, y=h["RSI"], line=dict(color=ACCENT, width=1.5), name="RSI", row=2, col=1)
     fig.add_hrect(y0=70, y1=100, fillcolor=DOWN, opacity=0.08, line_width=0, row=2, col=1)
     fig.add_hrect(y0=0, y1=30, fillcolor=UP, opacity=0.08, line_width=0, row=2, col=1)
@@ -241,7 +240,7 @@ with tab_ind:
     st.plotly_chart(base_layout(fig, 560), width="stretch")
 
     rsi = float(res.history["RSI"].iloc[-1])
-    rsi_txt = "overbought 🔥" if rsi > 70 else "oversold 🧊" if rsi < 30 else "in a normal zone"
+    rsi_txt = "overbought" if rsi > 70 else "oversold" if rsi < 30 else "in a normal zone"
     trend = "above" if last > res.history["MA50"].iloc[-1] else "below"
     a, b = st.columns(2)
     a.info(f"**RSI is {rsi:.0f}** — the stock looks {rsi_txt}. Above 70 often means it's run up fast; below 30 means it's been sold off hard.")
@@ -258,16 +257,16 @@ with tab_model:
     k[0].markdown(card("Avg error (MAE)", fmt(m["mae"]), f"{m['mape']:.2f}% of price"), unsafe_allow_html=True)
     k[1].markdown(card("RMSE", fmt(m["rmse"]), "penalises big misses"), unsafe_allow_html=True)
     k[2].markdown(card("Next-day direction", f"{m['direction_acc']:.0f}%", "coin flip = 50%"), unsafe_allow_html=True)
-    k[3].markdown(card("vs. “same as today”", "Beats it ✅" if beats else "Doesn't beat it",
-                       f"naive error {fmt(m['naive_mae'])}", UP if beats else "#F59E0B"), unsafe_allow_html=True)
+    k[3].markdown(card("vs. “same as today”", "Beats it" if beats else "Doesn't beat it",
+                       f"naive error {fmt(m['naive_mae'])}", UP if beats else REG), unsafe_allow_html=True)
 
     t = res.test
     fig = go.Figure()
-    fig.add_scatter(x=t.index, y=t["actual"], line=dict(color="#E6E8F0", width=2), name="Actual")
+    fig.add_scatter(x=t.index, y=t["actual"], line=dict(color=INK, width=2), name="Actual")
     fig.add_scatter(x=t.index, y=t["predicted"], line=dict(color=MODEL_COLOR, width=2), name="Predicted")
     st.plotly_chart(base_layout(fig, 400), width="stretch")
 
-    with st.expander("🤓 Under the hood", expanded=res.model == "regression"):
+    with st.expander("Model details", expanded=res.model == "regression"):
         if res.model == "lstm":
             st.markdown(
                 f"""
@@ -325,8 +324,8 @@ with tab_cmp:
         ("Next-day avg error (MAE)", fmt(ml["mae"]), fmt(mr["mae"]), winner(ml["mae"], mr["mae"])),
         ("Next-day RMSE", fmt(ml["rmse"]), fmt(mr["rmse"]), winner(ml["rmse"], mr["rmse"])),
         ("Next-day MAPE", f"{ml['mape']:.2f}%", f"{mr['mape']:.2f}%", winner(ml["mape"], mr["mape"])),
-        ("Beats “same as today”?", "✅" if ml["mae"] < ml["naive_mae"] else "❌",
-         "✅" if mr["mae"] < mr["naive_mae"] else "❌", f"naive MAE {fmt(ml['naive_mae'])}"),
+        ("Beats “same as today”?", "Yes" if ml["mae"] < ml["naive_mae"] else "No",
+         "Yes" if mr["mae"] < mr["naive_mae"] else "No", f"naive MAE {fmt(ml['naive_mae'])}"),
         ("Next-day direction hit-rate", f"{ml['direction_acc']:.1f}%", f"{mr['direction_acc']:.1f}%",
          winner(ml["direction_acc"], mr["direction_acc"], lower=False)),
         (f"{horizon}-day direction hit-rate", f"{ml[hk]:.1f}%", f"{mr[hk]:.1f}%", winner(ml[hk], mr[hk], lower=False)),
@@ -347,13 +346,13 @@ with tab_cmp:
     lstm_wins = sum(r[3] == MODELS["lstm"][0] for r in rows)
     reg_wins = sum(r[3] == MODELS["regression"][0] for r in rows)
     if lstm_wins > reg_wins:
-        verdict = f"🧠 **The LSTM wins {lstm_wins} of {lstm_wins + reg_wins} scored metrics** on {ticker}."
+        verdict = f"**The LSTM wins {lstm_wins} of {lstm_wins + reg_wins} scored metrics** on {ticker}."
     elif reg_wins > lstm_wins:
-        verdict = (f"📐 **The linear regression wins {reg_wins} of {lstm_wins + reg_wins} scored metrics** on {ticker}, "
+        verdict = (f"**The linear regression wins {reg_wins} of {lstm_wins + reg_wins} scored metrics** on {ticker}, "
                    f"with {R.extras['n_params'] / L.extras['n_params'] * 100:.0f}% of the LSTM's parameters "
                    "and training in milliseconds.")
     else:
-        verdict = f"🤝 **It's a draw on {ticker}.** The extra complexity of the LSTM doesn't clearly pay off here."
+        verdict = f"**It's a draw on {ticker}.** The extra complexity of the LSTM doesn't clearly pay off here."
     gap = abs(ml["mae"] - mr["mae"]) / ml["naive_mae"] * 100
     st.info(f"{verdict} Their next-day errors differ by {gap:.1f}% of the naive error. "
             f"They agree on the {horizon}-day direction on **{cmpm['agree_h']:.0f}%** of test days "
@@ -364,7 +363,7 @@ with tab_cmp:
         st.markdown("**Forecasts side by side**")
         h = res.history.tail(90)
         fig = go.Figure()
-        fig.add_scatter(x=h.index, y=h["Close"], line=dict(color="#E6E8F0", width=2), name="Close")
+        fig.add_scatter(x=h.index, y=h["Close"], line=dict(color=INK, width=2), name="Close")
         for r_ in (L, R):
             name, col = MODELS[r_.model]
             fx = [h.index[-1], *r_.future.index]
@@ -388,7 +387,7 @@ with tab_cmp:
     st.markdown("**Backtest: next-day predictions on unseen days**")
     lt, rt = L.test, R.test
     fig = go.Figure()
-    fig.add_scatter(x=lt.index, y=lt["actual"], line=dict(color="#E6E8F0", width=2), name="Actual")
+    fig.add_scatter(x=lt.index, y=lt["actual"], line=dict(color=INK, width=2), name="Actual")
     fig.add_scatter(x=lt.index, y=lt["predicted"], line=dict(color=ACCENT, width=1.5), name=MODELS["lstm"][0])
     fig.add_scatter(x=rt.index, y=rt["predicted"], line=dict(color=REG, width=1.5), name=MODELS["regression"][0])
     st.plotly_chart(base_layout(fig, 380), width="stretch")
@@ -398,7 +397,7 @@ with tab_cmp:
     hcol = f"pred_ret_{horizon}d"
     real = np.log(lt["actual"].shift(-(horizon - 1)) / lt["naive"]) * 100  # realised horizon return
     fig = go.Figure()
-    fig.add_scatter(x=lt.index, y=real, line=dict(color="#E6E8F0", width=1), name="Actual", opacity=0.6)
+    fig.add_scatter(x=lt.index, y=real, line=dict(color=INK, width=1), name="Actual", opacity=0.6)
     fig.add_scatter(x=lt.index, y=lt[hcol], line=dict(color=ACCENT, width=2), name=MODELS["lstm"][0])
     fig.add_scatter(x=rt.index, y=rt[hcol], line=dict(color=REG, width=2), name=MODELS["regression"][0])
     fig.add_hline(y=0, line=dict(color=MUTED, width=1, dash="dot"))
@@ -406,16 +405,16 @@ with tab_cmp:
     st.caption("Predicted lines that hug zero mean the model has found little reliable pattern and is hedging. "
                "Ridge regression usually does this more than the LSTM; that's caution, not a bug.")
 
-    with st.expander("🧩 How the two models differ"):
+    with st.expander("How the two models differ"):
         st.markdown(
             """
-| | 🧠 LSTM | 📐 Linear regression (Ridge) |
+| | LSTM | Linear regression (Ridge) |
 |---|---|---|
 | **What it sees** | The full 60-day sequence, step by step | 42 summary numbers (last 3 days + 5/20/60-day averages) |
 | **Shape of relationships** | Can learn curves, thresholds and interactions | Straight lines only: each input nudges the forecast up or down by a fixed amount |
 | **Training** | Gradient descent, 40 epochs, random seed matters | Exact closed-form solution, same answer every time |
 | **Overfitting control** | Dropout + weight decay | Ridge penalty α, tuned per forecast day |
-| **Explainability** | Black box | Every weight is readable (see 🧪 tab with Linear regression selected) |
+| **Explainability** | Black box | Every weight is readable (see the Model accuracy tab with Linear regression selected) |
 | **Speed** | ~10–20 s | milliseconds |
 
 **Why compare them?** Daily stock returns are mostly noise. If a simple linear model matches the LSTM, the
@@ -433,13 +432,13 @@ with tab_data:
     a, b = st.columns(2)
     a.markdown("**Forecast**")
     a.dataframe(out, width="stretch", height=320)
-    a.download_button("⬇️ Download forecast CSV", out.to_csv(), f"{ticker}_forecast.csv", "text/csv")
+    a.download_button("Download forecast CSV", out.to_csv(), f"{ticker}_forecast.csv", "text/csv")
     b.markdown("**Recent prices**")
     recent = prices.tail(60).iloc[::-1].round(2)
     b.dataframe(recent, width="stretch", height=320)
     bt = res_lstm.test[["actual", "naive", "predicted"]].rename(columns={"predicted": "lstm_predicted"})
     bt["regression_predicted"] = res_reg.test["predicted"]
-    b.download_button("⬇️ Download test results CSV", bt.round(2).to_csv(), f"{ticker}_backtest.csv", "text/csv")
+    b.download_button("Download test results CSV", bt.round(2).to_csv(), f"{ticker}_backtest.csv", "text/csv")
 
 st.markdown('<div class="disclaimer">For learning purposes only — not financial advice. '
             'Data from Yahoo Finance.</div>', unsafe_allow_html=True)
