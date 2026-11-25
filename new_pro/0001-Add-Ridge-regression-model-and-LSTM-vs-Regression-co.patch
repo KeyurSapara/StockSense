@@ -1,0 +1,675 @@
+From 722bf16538e48681effc579f890c4df84e8a4fbc Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 25 Nov 2026 17:40:53 +0530
+Subject: [PATCH] Add Ridge regression model and LSTM vs Regression comparison
+ to dashboard
+
+- predictor: shared _prepare/_build_result so both models use identical windows,
+  targets, split and metrics; new train_regression_and_forecast (closed-form
+  ridge, alpha tuned per forecast day on a validation slice) and compare()
+- app: Headline model toggle, forecast overlay, regression weights chart,
+  new LSTM vs Regression tab, both models in CSV exports
+- README: document the regression model
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Ad8kSFmkTkioEGxNrP2Muw
+---
+ README.md    |  20 ++++-
+ app.py       | 226 +++++++++++++++++++++++++++++++++++++++++++++-----
+ predictor.py | 228 ++++++++++++++++++++++++++++++++++++++++-----------
+ 3 files changed, 401 insertions(+), 73 deletions(-)
+
+diff --git a/README.md b/README.md
+index 4df0aea..902177e 100644
+--- a/README.md
++++ b/README.md
+@@ -6,6 +6,9 @@ A simple, good-looking stock prediction app. Pick a stock, choose 7/14/30 days,
+ - 🐂/🐻 **Plain-English signal** (bullish / bearish / neutral)
+ - 📊 **Indicators**: 20/50-day averages, Bollinger Bands, RSI, explained in plain words
+ - 🧪 **Honest model check**: MAE, RMSE, direction hit-rate, compared with the naive "tomorrow = today" guess
++- ⚖️ **LSTM vs Linear Regression**: a Ridge regression trained on the same data and split, with a head-to-head
++  metrics table, error-by-days-ahead chart, overlaid forecasts and backtests, and a plain-English verdict.
++  Switch which model drives the headline forecast with the **Headline model** toggle.
+ - 💾 **CSV export** of the forecast and the backtest
+ 
+ Works with any Yahoo Finance symbol: `AAPL`, `TSLA`, `RELIANCE.NS`, `TCS.NS`, `BTC-USD` …
+@@ -25,11 +28,24 @@ You don't need to train anything beforehand. The model trains on 5 years of data
+ |---|---|
+ | Data | 5 years of daily OHLCV from Yahoo Finance (`yfinance`) |
+ | Features | log return, gap from MA20/MA50, RSI, Bollinger position, volume change, 20-day volatility |
+-| Model | 2-layer LSTM (PyTorch), 60-day lookback, **multi-horizon output** (predicts all N future days at once) |
++| Model 1 | 2-layer LSTM (PyTorch), 60-day lookback, **multi-horizon output** (predicts all N future days at once) |
++| Model 2 | Ridge linear regression (NumPy, closed form) on 42 window summaries: last 3 days + 5/20/60-day averages of each feature. α tuned per forecast day on a validation slice of the training period |
+ | Target | cumulative % return, not raw price, so it can't cheat by copying yesterday's price |
+ | Split | chronological 80/20, scaler fit on train only (no data leakage) |
+ | Uncertainty | per-day residual spread on the test set → 80% band |
+ 
++### LSTM vs Regression: how they differ
++
++| | LSTM | Ridge regression |
++|---|---|---|
++| Sees | full 60-day sequence | 42 hand-built summaries of the same window |
++| Relationships | non-linear, interactions | straight lines only |
++| Training | 40 epochs of gradient descent (~15 s) | exact solution (milliseconds), deterministic |
++| Explainability | black box | readable weights (shown in the app) |
++
++Both use the same features, targets, train/test split and evaluation, so the ⚖️ tab compares like with like.
++If the regression keeps up with the LSTM, the neural network isn't finding extra structure in the noise.
++
+ ### Compared with NeuroStock
+ - PyTorch + Plotly (interactive) instead of Keras + Matplotlib
+ - Trains live for **any** ticker, so there's no stale pre-trained `.h5` file
+@@ -40,5 +56,5 @@ You don't need to train anything beforehand. The model trains on 5 years of data
+ 
+ ## Files
+ - `app.py`: Streamlit UI
+-- `predictor.py`: data, indicators, LSTM model, training and evaluation
++- `predictor.py`: data, indicators, LSTM + Ridge regression models, shared training/evaluation and `compare()`
+ - `.streamlit/config.toml`: dark theme
+diff --git a/app.py b/app.py
+index 74ab564..ea703de 100644
+--- a/app.py
++++ b/app.py
+@@ -1,5 +1,9 @@
+ """StockSense — a friendly AI stock forecaster.  Run:  streamlit run app.py"""
+ 
++import time
++
++import numpy as np
++import pandas as pd
+ import plotly.graph_objects as go
+ from plotly.subplots import make_subplots
+ import streamlit as st
+@@ -9,6 +13,8 @@ import predictor
+ st.set_page_config(page_title="StockSense · AI Stock Forecaster", page_icon="🔮", layout="wide")
+ 
+ UP, DOWN, ACCENT, MUTED = "#22C55E", "#EF4444", "#7C5CFF", "#8B93A7"
++REG = "#F59E0B"  # colour for the regression model
++MODELS = {"lstm": ("🧠 LSTM", ACCENT), "regression": ("📐 Linear regression", REG)}
+ POPULAR = {
+     "🍎 Apple": "AAPL", "⚡ Tesla": "TSLA", "🟩 NVIDIA": "NVDA", "🔎 Google": "GOOGL",
+     "🏭 Reliance": "RELIANCE.NS", "💻 TCS": "TCS.NS", "🏦 HDFC Bank": "HDFCBANK.NS", "₿ Bitcoin": "BTC-USD",
+@@ -53,7 +59,18 @@ def get_info(ticker):
+ 
+ @st.cache_resource(ttl=3600, show_spinner=False, max_entries=20)
+ def get_forecast(ticker, horizon, _progress=None):
+-    return predictor.train_and_forecast(get_prices(ticker), horizon=horizon, progress=_progress)
++    t0 = time.perf_counter()
++    res = predictor.train_and_forecast(get_prices(ticker), horizon=horizon, progress=_progress)
++    res.extras["train_seconds"] = time.perf_counter() - t0
++    return res
++
++
++@st.cache_resource(ttl=3600, show_spinner=False, max_entries=20)
++def get_regression(ticker, horizon):
++    t0 = time.perf_counter()
++    res = predictor.train_regression_and_forecast(get_prices(ticker), horizon=horizon)
++    res.extras["train_seconds"] = time.perf_counter() - t0
++    return res
+ 
+ 
+ def card(label, value, sub="", color=None):
+@@ -90,11 +107,14 @@ for col, (label, sym) in zip(cols, POPULAR.items()):
+         st.session_state.ticker = sym
+         st.rerun()
+ 
+-c1, c2 = st.columns([3, 2])
++c1, c2, c3 = st.columns([3, 2, 2])
+ typed = c1.text_input("Or type any ticker", value=st.session_state.ticker,
+                       help="Yahoo Finance symbols: AAPL, MSFT, INFY.NS (NSE India), ETH-USD …")
+ horizon = c2.select_slider("Forecast horizon", options=[7, 14, 30], value=14,
+                            format_func=lambda d: f"{d} days")
++model_key = c3.radio("Headline model", list(MODELS), format_func=lambda k: MODELS[k][0], horizontal=True,
++                     help="Both models are always trained. This picks which one drives the cards and forecast chart. "
++                          "See the ⚖️ tab for a head-to-head.")
+ ticker = typed.strip().upper()
+ st.session_state.ticker = ticker
+ 
+@@ -110,9 +130,14 @@ if prices.empty or len(prices) < 300:
+ info = get_info(ticker)
+ cur = CURRENCY.get(info["currency"], info["currency"] + " " if info["currency"] else "")
+ bar = st.empty()
+-res = get_forecast(ticker, horizon,
+-                   _progress=lambda f: bar.progress(f, text=f"🧠 Training the neural network… {int(f * 100)}%"))
++res_lstm = get_forecast(ticker, horizon,
++                        _progress=lambda f: bar.progress(f, text=f"🧠 Training the neural network… {int(f * 100)}%"))
+ bar.empty()
++res_reg = get_regression(ticker, horizon)
++res = res_lstm if model_key == "lstm" else res_reg
++other = res_reg if model_key == "lstm" else res_lstm
++MODEL_NAME, MODEL_COLOR = MODELS[res.model]
++OTHER_NAME, OTHER_COLOR = MODELS[other.model]
+ fmt = lambda v: f"{cur}{v:,.2f}"
+ 
+ # ---------------------------------------------------------------------------
+@@ -127,8 +152,8 @@ lo, hi = float(res.future["low"].iloc[-1]), float(res.future["high"].iloc[-1])
+ exp_chg = (target / last - 1) * 100
+ m = res.metrics
+ 
+-st.markdown(f"### {info['name']} <span style='color:{MUTED};font-size:1rem'>· {ticker}</span>",
+-            unsafe_allow_html=True)
++st.markdown(f"### {info['name']} <span style='color:{MUTED};font-size:1rem'>· {ticker} · "
++            f"forecast by {MODEL_NAME}</span>", unsafe_allow_html=True)
+ 
+ k = st.columns(4)
+ k[0].markdown(card("Current price", fmt(last), f"{'▲' if day_chg >= 0 else '▼'} {day_chg:+.2f}% today",
+@@ -144,20 +169,26 @@ band = (hi - lo) / 2 / last * 100
+ if abs(exp_chg) < band * 0.25:
+     mood, color, msg = "😐 Neutral", MUTED, "The predicted move is small compared to the uncertainty — no clear direction."
+ elif exp_chg > 0:
+-    mood, color, msg = "🐂 Leaning bullish", UP, f"The model expects a rise of about {exp_chg:.1f}% over {horizon} days."
++    mood, color, msg = "🐂 Leaning bullish", UP, f"The {MODEL_NAME} model expects a rise of about {exp_chg:.1f}% over {horizon} days."
+ else:
+-    mood, color, msg = "🐻 Leaning bearish", DOWN, f"The model expects a drop of about {abs(exp_chg):.1f}% over {horizon} days."
++    mood, color, msg = "🐻 Leaning bearish", DOWN, f"The {MODEL_NAME} model expects a drop of about {abs(exp_chg):.1f}% over {horizon} days."
+ st.markdown(f'<div class="signal" style="background:{color}1A;border:1px solid {color}55">'
+             f'<b style="color:{color}">{mood}</b> &nbsp;—&nbsp; {msg}</div>', unsafe_allow_html=True)
++other_chg = (float(other.future["pred"].iloc[-1]) / last - 1) * 100
++if np.sign(other_chg) != np.sign(exp_chg):
++    st.caption(f"⚠️ The {OTHER_NAME} model disagrees on direction ({other_chg:+.1f}%). See the ⚖️ tab.")
+ 
+ # ---------------------------------------------------------------------------
+ # Tabs
+ # ---------------------------------------------------------------------------
+ 
+-tab_fc, tab_ind, tab_model, tab_data = st.tabs(["📈 Forecast", "📊 Indicators", "🧪 How good is the model?", "💾 Data"])
++tab_fc, tab_ind, tab_model, tab_cmp, tab_data = st.tabs(
++    ["📈 Forecast", "📊 Indicators", "🧪 How good is the model?", "⚖️ LSTM vs Regression", "💾 Data"])
+ 
+ with tab_fc:
+-    rng = st.radio("Show history", ["3M", "6M", "1Y", "All"], index=1, horizontal=True, label_visibility="collapsed")
++    r1, r2 = st.columns([3, 2])
++    rng = r1.radio("Show history", ["3M", "6M", "1Y", "All"], index=1, horizontal=True, label_visibility="collapsed")
++    overlay = r2.toggle(f"Overlay {OTHER_NAME} forecast", value=True)
+     days = {"3M": 63, "6M": 126, "1Y": 252, "All": len(prices)}[rng]
+     h = res.history.tail(days)
+     f = res.future
+@@ -167,9 +198,13 @@ with tab_fc:
+     # Connect the forecast to the last real close so the line doesn't float
+     fx = [h.index[-1], *f.index]
+     fig.add_scatter(x=fx, y=[last, *f["high"]], line=dict(width=0), showlegend=False, hoverinfo="skip")
+-    fig.add_scatter(x=fx, y=[last, *f["low"]], fill="tonexty", fillcolor="rgba(124,92,255,0.18)",
++    fig.add_scatter(x=fx, y=[last, *f["low"]], fill="tonexty", fillcolor=MODEL_COLOR + "2E",
+                     line=dict(width=0), name="80% range")
+-    fig.add_scatter(x=fx, y=[last, *f["pred"]], line=dict(color=ACCENT, width=3, dash="dot"), name="AI forecast")
++    fig.add_scatter(x=fx, y=[last, *f["pred"]], line=dict(color=MODEL_COLOR, width=3, dash="dot"),
++                    name=f"{MODEL_NAME} forecast")
++    if overlay:
++        fig.add_scatter(x=fx, y=[last, *other.future["pred"]], line=dict(color=OTHER_COLOR, width=2, dash="dash"),
++                        name=f"{OTHER_NAME} forecast", opacity=0.8)
+     fig.add_vline(x=h.index[-1], line=dict(color=MUTED, dash="dash", width=1))
+     st.plotly_chart(base_layout(fig, 520), width="stretch")
+     st.caption("Shaded area = where the price landed 80% of the time, based on the model's past mistakes. "
+@@ -214,26 +249,171 @@ with tab_model:
+     t = res.test
+     fig = go.Figure()
+     fig.add_scatter(x=t.index, y=t["actual"], line=dict(color="#E6E8F0", width=2), name="Actual")
+-    fig.add_scatter(x=t.index, y=t["predicted"], line=dict(color=ACCENT, width=2), name="Predicted")
++    fig.add_scatter(x=t.index, y=t["predicted"], line=dict(color=MODEL_COLOR, width=2), name="Predicted")
+     st.plotly_chart(base_layout(fig, 400), width="stretch")
+ 
+-    with st.expander("🤓 Under the hood"):
+-        st.markdown(
+-            f"""
+-- **Model:** 2-layer LSTM (PyTorch) → predicts the % change for each of the next {horizon} days at once.
++    with st.expander("🤓 Under the hood", expanded=res.model == "regression"):
++        if res.model == "lstm":
++            st.markdown(
++                f"""
++- **Model:** 2-layer LSTM (PyTorch, {res.extras['n_params']:,} parameters) → predicts the % change for each of the next {horizon} days at once.
+ - **Inputs:** last 60 days of returns, distance from 20/50-day averages, RSI, Bollinger position, volume change, volatility.
+ - **Why returns, not prices?** A model predicting raw prices can look perfect by just copying yesterday's price.
+   Predicting *changes* is harder but honest, and the same model works for a ₹100 or a $50,000 asset.
+ - **Honest check:** we compare against the naive "tomorrow = today" guess. Markets are very hard to predict;
+   if the AI doesn't beat it, that's a real finding, not a bug.
++"""
++            )
++            lf = go.Figure(go.Scatter(y=res.losses, line=dict(color=ACCENT)))
++            lf.update_layout(title="Training loss", xaxis_title="epoch")
++            st.plotly_chart(base_layout(lf, 260), width="stretch")
++        else:
++            al = res.extras["alphas"]
++            st.markdown(
++                f"""
++- **Model:** Ridge linear regression ({res.extras['n_params']:,} weights), one straight-line equation per forecast day.
++- **Inputs:** the same 7 indicators, but summarised: today, yesterday and the day before, plus their 5/20/60-day averages
++  (42 numbers). A linear model can't "read" a 60-day sequence like the LSTM, so we hand it the summaries.
++- **Same targets & split as the LSTM**, so the comparison is fair.
++- **Ridge penalty (α)** shrinks the weights towards zero to stop overfitting noise. It's tuned separately for each day ahead on
++  the last 20% of the training period: day 1 → α = {al[0]:g}, day {horizon} → α = {al[-1]:g}.
++  A huge α means "there's barely any pattern here, stay close to the average move".
++"""
++            )
++            coefs = res.extras["coefs"][f"day_{horizon}"]
++            top = coefs.reindex(coefs.abs().sort_values().index).tail(12)
++            cf = go.Figure(go.Bar(x=top.values, y=top.index, orientation="h",
++                                  marker_color=[UP if v > 0 else DOWN for v in top.values]))
++            cf.update_layout(title=f"What drives the {horizon}-day forecast (top 12 weights)",
++                             xaxis_title="effect on % return per 1 std-dev of input")
++            st.plotly_chart(base_layout(cf, 380), width="stretch")
++            st.caption("Green pushes the forecast up, red pushes it down. This transparency is the main thing a linear "
++                       "model gives you that the LSTM can't.")
++
++with tab_cmp:
++    L, R = res_lstm, res_reg
++    ml, mr = L.metrics, R.metrics
++    cmpm = predictor.compare(L, R)
++    hk = f"direction_acc_{horizon}d"
++
++    st.markdown(
++        "Both models see the **same stock, the same 7 indicators, the same training days and the same "
++        f"{ml['n_test']} unseen test days**. The only difference is the model itself."
++    )
++
++    def winner(a, b, lower=True):
++        if abs(a - b) < 1e-9:
++            return "Tie"
++        return MODELS["lstm"][0] if (a < b) == lower else MODELS["regression"][0]
++
++    rows = [
++        ("Next-day avg error (MAE)", fmt(ml["mae"]), fmt(mr["mae"]), winner(ml["mae"], mr["mae"])),
++        ("Next-day RMSE", fmt(ml["rmse"]), fmt(mr["rmse"]), winner(ml["rmse"], mr["rmse"])),
++        ("Next-day MAPE", f"{ml['mape']:.2f}%", f"{mr['mape']:.2f}%", winner(ml["mape"], mr["mape"])),
++        ("Beats “same as today”?", "✅" if ml["mae"] < ml["naive_mae"] else "❌",
++         "✅" if mr["mae"] < mr["naive_mae"] else "❌", f"naive MAE {fmt(ml['naive_mae'])}"),
++        ("Next-day direction hit-rate", f"{ml['direction_acc']:.1f}%", f"{mr['direction_acc']:.1f}%",
++         winner(ml["direction_acc"], mr["direction_acc"], lower=False)),
++        (f"{horizon}-day direction hit-rate", f"{ml[hk]:.1f}%", f"{mr[hk]:.1f}%", winner(ml[hk], mr[hk], lower=False)),
++        (f"Avg {horizon}-day % error", f"{ml['horizon_mae'][-1]:.2f}%", f"{mr['horizon_mae'][-1]:.2f}%",
++         winner(ml["horizon_mae"][-1], mr["horizon_mae"][-1])),
++        (f"Forecast {horizon} days out", fmt(L.future['pred'].iloc[-1]), fmt(R.future['pred'].iloc[-1]),
++         f"{(L.future['pred'].iloc[-1] / last - 1) * 100:+.1f}% vs {(R.future['pred'].iloc[-1] / last - 1) * 100:+.1f}%"),
++        (f"80% range width (day {horizon})",
++         f"±{(L.future['high'].iloc[-1] - L.future['low'].iloc[-1]) / 2 / last * 100:.1f}%",
++         f"±{(R.future['high'].iloc[-1] - R.future['low'].iloc[-1]) / 2 / last * 100:.1f}%", "narrower = more confident"),
++        ("Parameters", f"{L.extras['n_params']:,}", f"{R.extras['n_params']:,}", ""),
++        ("Training time", f"{L.extras.get('train_seconds', 0):.1f} s", f"{R.extras.get('train_seconds', 0) * 1000:.0f} ms", ""),
++    ]
++    table = pd.DataFrame(rows, columns=["Metric", MODELS["lstm"][0], MODELS["regression"][0], "Better / note"])
++    st.dataframe(table, hide_index=True, width="stretch")
++
++    # Plain-English verdict
++    lstm_wins = sum(r[3] == MODELS["lstm"][0] for r in rows)
++    reg_wins = sum(r[3] == MODELS["regression"][0] for r in rows)
++    if lstm_wins > reg_wins:
++        verdict = f"🧠 **The LSTM wins {lstm_wins} of {lstm_wins + reg_wins} scored metrics** on {ticker}."
++    elif reg_wins > lstm_wins:
++        verdict = (f"📐 **The linear regression wins {reg_wins} of {lstm_wins + reg_wins} scored metrics** on {ticker}, "
++                   f"with {R.extras['n_params'] / L.extras['n_params'] * 100:.0f}% of the LSTM's parameters "
++                   "and training in milliseconds.")
++    else:
++        verdict = f"🤝 **It's a draw on {ticker}.** The extra complexity of the LSTM doesn't clearly pay off here."
++    gap = abs(ml["mae"] - mr["mae"]) / ml["naive_mae"] * 100
++    st.info(f"{verdict} Their next-day errors differ by {gap:.1f}% of the naive error. "
++            f"They agree on the {horizon}-day direction on **{cmpm['agree_h']:.0f}%** of test days "
++            f"(correlation {cmpm['corr_h']:.2f}).")
++
++    a, b = st.columns(2)
++    with a:
++        st.markdown("**Forecasts side by side**")
++        h = res.history.tail(90)
++        fig = go.Figure()
++        fig.add_scatter(x=h.index, y=h["Close"], line=dict(color="#E6E8F0", width=2), name="Close")
++        for r_ in (L, R):
++            name, col = MODELS[r_.model]
++            fx = [h.index[-1], *r_.future.index]
++            fig.add_scatter(x=fx, y=[last, *r_.future["high"]], line=dict(width=0), showlegend=False, hoverinfo="skip")
++            fig.add_scatter(x=fx, y=[last, *r_.future["low"]], fill="tonexty", fillcolor=col + "22",
++                            line=dict(width=0), showlegend=False, hoverinfo="skip")
++            fig.add_scatter(x=fx, y=[last, *r_.future["pred"]], line=dict(color=col, width=3, dash="dot"), name=name)
++        st.plotly_chart(base_layout(fig, 380), width="stretch")
++    with b:
++        st.markdown("**Error vs. how far ahead** (lower is better)")
++        d = list(range(1, horizon + 1))
++        fig = go.Figure()
++        fig.add_scatter(x=d, y=ml["horizon_mae"], line=dict(color=ACCENT, width=2.5), name=MODELS["lstm"][0])
++        fig.add_scatter(x=d, y=mr["horizon_mae"], line=dict(color=REG, width=2.5), name=MODELS["regression"][0])
++        fig.add_scatter(x=d, y=ml["naive_horizon_mae"], line=dict(color=MUTED, width=1.5, dash="dash"),
++                        name="Naive: no change")
++        fig.update_xaxes(title="days ahead")
++        fig.update_yaxes(title="avg |error| in % return")
++        st.plotly_chart(base_layout(fig, 380), width="stretch")
++
++    st.markdown("**Backtest: next-day predictions on unseen days**")
++    lt, rt = L.test, R.test
++    fig = go.Figure()
++    fig.add_scatter(x=lt.index, y=lt["actual"], line=dict(color="#E6E8F0", width=2), name="Actual")
++    fig.add_scatter(x=lt.index, y=lt["predicted"], line=dict(color=ACCENT, width=1.5), name=MODELS["lstm"][0])
++    fig.add_scatter(x=rt.index, y=rt["predicted"], line=dict(color=REG, width=1.5), name=MODELS["regression"][0])
++    st.plotly_chart(base_layout(fig, 380), width="stretch")
++
++    st.markdown("**What each model predicted for the move, vs. what really happened** "
++                f"({horizon}-day % return, test period)")
++    hcol = f"pred_ret_{horizon}d"
++    real = np.log(lt["actual"].shift(-(horizon - 1)) / lt["naive"]) * 100  # realised horizon return
++    fig = go.Figure()
++    fig.add_scatter(x=lt.index, y=real, line=dict(color="#E6E8F0", width=1), name="Actual", opacity=0.6)
++    fig.add_scatter(x=lt.index, y=lt[hcol], line=dict(color=ACCENT, width=2), name=MODELS["lstm"][0])
++    fig.add_scatter(x=rt.index, y=rt[hcol], line=dict(color=REG, width=2), name=MODELS["regression"][0])
++    fig.add_hline(y=0, line=dict(color=MUTED, width=1, dash="dot"))
++    st.plotly_chart(base_layout(fig, 340), width="stretch")
++    st.caption("Predicted lines that hug zero mean the model has found little reliable pattern and is hedging. "
++               "Ridge regression usually does this more than the LSTM; that's caution, not a bug.")
++
++    with st.expander("🧩 How the two models differ"):
++        st.markdown(
++            """
++| | 🧠 LSTM | 📐 Linear regression (Ridge) |
++|---|---|---|
++| **What it sees** | The full 60-day sequence, step by step | 42 summary numbers (last 3 days + 5/20/60-day averages) |
++| **Shape of relationships** | Can learn curves, thresholds and interactions | Straight lines only: each input nudges the forecast up or down by a fixed amount |
++| **Training** | Gradient descent, 40 epochs, random seed matters | Exact closed-form solution, same answer every time |
++| **Overfitting control** | Dropout + weight decay | Ridge penalty α, tuned per forecast day |
++| **Explainability** | Black box | Every weight is readable (see 🧪 tab with Linear regression selected) |
++| **Speed** | ~10–20 s | milliseconds |
++
++**Why compare them?** Daily stock returns are mostly noise. If a simple linear model matches the LSTM, the
++"deep learning" isn't finding extra structure, and the simpler model is the better choice. If the LSTM wins
++clearly and consistently across stocks, it's picking up non-linear patterns the regression can't.
+ """
+         )
+-        lf = go.Figure(go.Scatter(y=res.losses, line=dict(color=ACCENT)))
+-        lf.update_layout(title="Training loss", xaxis_title="epoch")
+-        st.plotly_chart(base_layout(lf, 260), width="stretch")
+ 
+ with tab_data:
+-    out = res.future.rename(columns={"pred": "Forecast", "low": "Low (80%)", "high": "High (80%)"}).round(2)
++    out = pd.concat({"LSTM": res_lstm.future, "Regression": res_reg.future}, axis=1)
++    out.columns = [f"{m} {c}" for m, c in out.columns]
++    out = out.rename(columns=lambda c: c.replace("pred", "forecast").replace("low", "low (80%)")
++                     .replace("high", "high (80%)")).round(2)
+     out.index.name = "Date"
+     a, b = st.columns(2)
+     a.markdown("**Forecast**")
+@@ -242,7 +422,9 @@ with tab_data:
+     b.markdown("**Recent prices**")
+     recent = prices.tail(60).iloc[::-1].round(2)
+     b.dataframe(recent, width="stretch", height=320)
+-    b.download_button("⬇️ Download test results CSV", res.test.round(2).to_csv(), f"{ticker}_backtest.csv", "text/csv")
++    bt = res_lstm.test[["actual", "naive", "predicted"]].rename(columns={"predicted": "lstm_predicted"})
++    bt["regression_predicted"] = res_reg.test["predicted"]
++    b.download_button("⬇️ Download test results CSV", bt.round(2).to_csv(), f"{ticker}_backtest.csv", "text/csv")
+ 
+ st.markdown('<div class="disclaimer">For learning purposes only — not financial advice. '
+             'Data from Yahoo Finance.</div>', unsafe_allow_html=True)
+diff --git a/predictor.py b/predictor.py
+index ef0facc..d6edaed 100644
+--- a/predictor.py
++++ b/predictor.py
+@@ -1,4 +1,11 @@
+-"""Data loading, feature engineering and the LSTM forecaster behind the app.
++"""Data loading, feature engineering and the two forecasters behind the app.
++
++Two models are trained on exactly the same windows, targets and train/test
++split so they can be compared fairly:
++
++* an LSTM (PyTorch) that reads the raw 60-day feature sequence, and
++* a Ridge linear regression (NumPy, closed form) that sees hand-built
++  summaries of the same window (recent lags + 5/20/60-day averages).
+ 
+ Instead of predicting raw prices (which makes models look great while just
+ copying yesterday's price), the network predicts the *cumulative % return*
+@@ -7,7 +14,7 @@ known close, and uncertainty bands come from the model's own errors on the
+ held-out test period.
+ """
+ 
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ 
+ import numpy as np
+ import pandas as pd
+@@ -93,6 +100,8 @@ class ForecastResult:
+     test: pd.DataFrame             # date, actual, predicted, naive (1-day-ahead)
+     metrics: dict
+     losses: list
++    model: str = "lstm"
++    extras: dict = field(default_factory=dict)   # model-specific details (e.g. ridge coefficients)
+ 
+ 
+ def _windows(feats: np.ndarray, close: np.ndarray, lookback: int, horizon: int):
+@@ -104,62 +113,22 @@ def _windows(feats: np.ndarray, close: np.ndarray, lookback: int, horizon: int):
+     return np.array(X, dtype=np.float32), np.array(Y, dtype=np.float32), np.array(idx)
+ 
+ 
+-def train_and_forecast(
+-    df: pd.DataFrame,
+-    horizon: int = 30,
+-    lookback: int = 60,
+-    epochs: int = 40,
+-    test_frac: float = 0.2,
+-    seed: int = 42,
+-    progress=None,
+-) -> ForecastResult:
+-    torch.manual_seed(seed)
+-    np.random.seed(seed)
+-
++def _prepare(df: pd.DataFrame, horizon: int, lookback: int, test_frac: float):
++    """Indicators, windows and a chronological split shared by both models."""
+     data = add_indicators(df)
+     close = data["Close"].to_numpy()
+     raw = data[FEATURES].to_numpy(dtype=np.float32)
+-
+     X, Y, idx = _windows(raw, close, lookback, horizon)
+     split = int(len(X) * (1 - test_frac))
+-
+     # Standardise with statistics from the training period only (no leakage)
+     train_rows = raw[: idx[split - 1] + 1]
+     mu, sd = train_rows.mean(0), train_rows.std(0) + 1e-6
+-    X = (X - mu) / sd
+-    y_scale = float(Y[:split].std()) + 1e-6
++    return data, close, raw, X, Y, idx, split, mu, sd
+ 
+-    Xtr, Ytr = torch.tensor(X[:split]), torch.tensor(Y[:split] / y_scale)
+-    Xte, Yte = torch.tensor(X[split:]), Y[split:]
+ 
+-    model = LSTMForecaster(len(FEATURES), horizon)
+-    opt = torch.optim.AdamW(model.parameters(), lr=2e-3, weight_decay=1e-4)
+-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, epochs)
+-    loss_fn = nn.HuberLoss()
+-
+-    losses = []
+-    for epoch in range(epochs):
+-        model.train()
+-        perm = torch.randperm(len(Xtr))
+-        total = 0.0
+-        for i in range(0, len(Xtr), 64):
+-            b = perm[i : i + 64]
+-            opt.zero_grad()
+-            loss = loss_fn(model(Xtr[b]), Ytr[b])
+-            loss.backward()
+-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+-            opt.step()
+-            total += loss.item() * len(b)
+-        sched.step()
+-        losses.append(total / len(Xtr))
+-        if progress:
+-            progress((epoch + 1) / epochs)
+-
+-    model.eval()
+-    with torch.no_grad():
+-        pred_te = model(Xte).numpy() * y_scale
+-        last = torch.tensor(((raw[-lookback:] - mu) / sd)[None], dtype=torch.float32)
+-        pred_future = model(last).numpy()[0] * y_scale
++def _build_result(df, data, close, idx, split, Y, pred_te, pred_future, horizon, model, losses=None, extras=None):
++    """Turn % log-return predictions into prices, metrics and an 80% band."""
++    Yte = Y[split:]
+ 
+     # ---- Test-period evaluation (1-day-ahead) -------------------------------
+     te_idx = idx[split:]
+@@ -178,6 +147,9 @@ def train_and_forecast(
+         "naive_mae": mae(actual, naive),
+         "direction_acc": float(np.mean(np.sign(pred_te[:, 0]) == np.sign(Yte[:, 0])) * 100),
+         f"direction_acc_{horizon}d": float(np.mean(np.sign(pred_te[:, -1]) == np.sign(Yte[:, -1])) * 100),
++        # error (in % return) for each day ahead, vs. predicting "no change"
++        "horizon_mae": np.abs(Yte - pred_te).mean(0).tolist(),
++        "naive_horizon_mae": np.abs(Yte).mean(0).tolist(),
+         "n_test": int(len(te_idx)),
+         "n_train": int(split),
+     }
+@@ -201,4 +173,162 @@ def train_and_forecast(
+         {"actual": actual, "predicted": predicted, "naive": naive},
+         index=data.index[te_idx + 1],
+     )
+-    return ForecastResult(history=data, future=future, test=test, metrics=metrics, losses=losses)
++    test["pred_ret_1d"] = pred_te[:, 0]
++    test[f"pred_ret_{horizon}d"] = pred_te[:, -1]
++    return ForecastResult(history=data, future=future, test=test, metrics=metrics,
++                          losses=losses or [], model=model, extras=extras or {})
++
++
++def train_and_forecast(
++    df: pd.DataFrame,
++    horizon: int = 30,
++    lookback: int = 60,
++    epochs: int = 40,
++    test_frac: float = 0.2,
++    seed: int = 42,
++    progress=None,
++) -> ForecastResult:
++    """Train the LSTM and forecast."""
++    torch.manual_seed(seed)
++    np.random.seed(seed)
++
++    data, close, raw, X, Y, idx, split, mu, sd = _prepare(df, horizon, lookback, test_frac)
++    X = (X - mu) / sd
++    y_scale = float(Y[:split].std()) + 1e-6
++
++    Xtr, Ytr = torch.tensor(X[:split]), torch.tensor(Y[:split] / y_scale)
++    Xte = torch.tensor(X[split:])
++
++    model = LSTMForecaster(len(FEATURES), horizon)
++    opt = torch.optim.AdamW(model.parameters(), lr=2e-3, weight_decay=1e-4)
++    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, epochs)
++    loss_fn = nn.HuberLoss()
++
++    losses = []
++    for epoch in range(epochs):
++        model.train()
++        perm = torch.randperm(len(Xtr))
++        total = 0.0
++        for i in range(0, len(Xtr), 64):
++            b = perm[i : i + 64]
++            opt.zero_grad()
++            loss = loss_fn(model(Xtr[b]), Ytr[b])
++            loss.backward()
++            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
++            opt.step()
++            total += loss.item() * len(b)
++        sched.step()
++        losses.append(total / len(Xtr))
++        if progress:
++            progress((epoch + 1) / epochs)
++
++    model.eval()
++    with torch.no_grad():
++        pred_te = model(Xte).numpy() * y_scale
++        last = torch.tensor(((raw[-lookback:] - mu) / sd)[None], dtype=torch.float32)
++        pred_future = model(last).numpy()[0] * y_scale
++
++    n_params = sum(p.numel() for p in model.parameters())
++    return _build_result(df, data, close, idx, split, Y, pred_te, pred_future, horizon,
++                         model="lstm", losses=losses, extras={"n_params": int(n_params)})
++
++
++# ----------------------------------------------------------------------------
++# Regression model
++# ----------------------------------------------------------------------------
++
++RIDGE_LAGS = (0, 1, 2)          # today, yesterday, day before
++RIDGE_AVGS = (5, 20, 60)        # rolling means over the lookback window
++RIDGE_ALPHAS = (0.1, 1.0, 3.0, 10.0, 30.0, 100.0, 300.0, 1000.0, 3000.0, 10000.0)
++
++
++def ridge_feature_names() -> list:
++    names = [f"{f} (lag {k})" for k in RIDGE_LAGS for f in FEATURES]
++    names += [f"{f} ({w}d avg)" for w in RIDGE_AVGS for f in FEATURES]
++    return names
++
++
++def _ridge_design(windows: np.ndarray) -> np.ndarray:
++    """Flatten (n, lookback, n_feat) windows into a tabular design matrix.
++
++    A linear model can't read a sequence the way an LSTM does, so we give it
++    the information explicitly: the last few days, plus short/medium/long
++    averages of every feature over the window.
++    """
++    cols = [windows[:, -1 - k] for k in RIDGE_LAGS]
++    cols += [windows[:, -w:].mean(1) for w in RIDGE_AVGS]
++    return np.concatenate(cols, axis=1)
++
++
++def _ridge_fit(Z: np.ndarray, Y: np.ndarray, alpha: float):
++    """Closed-form multi-output ridge: W = (ZᵀZ + αI)⁻¹ ZᵀY, intercept unpenalised."""
++    z_mu, y_mu = Z.mean(0), Y.mean(0)
++    Zc, Yc = Z - z_mu, Y - y_mu
++    A = Zc.T @ Zc + alpha * np.eye(Z.shape[1])
++    W = np.linalg.solve(A, Zc.T @ Yc)
++    b = y_mu - z_mu @ W
++    return W, b
++
++
++def train_regression_and_forecast(
++    df: pd.DataFrame,
++    horizon: int = 30,
++    lookback: int = 60,
++    test_frac: float = 0.2,
++    val_frac: float = 0.2,
++) -> ForecastResult:
++    """Ridge linear regression on the same windows/targets/split as the LSTM.
++
++    The regularisation strength α is picked per forecast day on the last
++    `val_frac` of the training period (never the test set), then the model
++    is refit on all training data.
++    """
++    data, close, raw, X, Y, idx, split, mu, sd = _prepare(df, horizon, lookback, test_frac)
++    Z = _ridge_design((X - mu) / sd).astype(np.float64)
++    z_sd = Z[:split].std(0) + 1e-6           # put every column on the same scale for the penalty
++    Z = Z / z_sd
++    Ztr, Ytr = Z[:split], Y[:split].astype(np.float64)
++
++    # --- choose alpha on a chronological validation slice -------------------
++    # Each day-ahead target is its own regression, so each gets its own α:
++    # day 1 may carry signal while day 30 is mostly noise and needs heavy shrinkage.
++    # Leave a `horizon`-day gap so validation targets don't overlap training ones.
++    v = int(split * (1 - val_frac))
++    fit_end = max(v - horizon, 1)
++    val_err = np.stack([
++        np.abs(Ztr[v:] @ W + b - Ytr[v:]).mean(0)
++        for W, b in (_ridge_fit(Ztr[:fit_end], Ytr[:fit_end], a) for a in RIDGE_ALPHAS)
++    ])                                               # (n_alphas, horizon)
++    best = val_err.argmin(0)
++    alphas = np.array(RIDGE_ALPHAS)[best]
++
++    W = np.zeros((Z.shape[1], horizon))
++    b = np.zeros(horizon)
++    for ai in np.unique(best):
++        cols = best == ai
++        Wa, ba = _ridge_fit(Ztr, Ytr[:, cols], RIDGE_ALPHAS[ai])
++        W[:, cols], b[cols] = Wa, ba
++    pred_te = Z[split:] @ W + b
++    last = _ridge_design(((raw[-lookback:] - mu) / sd)[None]) / z_sd
++    pred_future = (last @ W + b)[0]
++
++    coefs = pd.DataFrame(W, index=ridge_feature_names(), columns=[f"day_{d + 1}" for d in range(horizon)])
++    train_mae = float(np.abs(Ztr @ W + b - Ytr).mean())
++    return _build_result(
++        df, data, close, idx, split, Y, pred_te.astype(np.float32), pred_future, horizon,
++        model="regression",
++        extras={"alphas": alphas.tolist(), "coefs": coefs,
++                "n_params": int(W.size + b.size), "train_mae": train_mae},
++    )
++
++
++def compare(lstm: ForecastResult, reg: ForecastResult) -> dict:
++    """Head-to-head stats on the shared test set."""
++    a, b = lstm.test, reg.test
++    h = [c for c in a.columns if c.startswith("pred_ret_") and c != "pred_ret_1d"][0]
++    return {
++        "agree_1d": float(np.mean(np.sign(a["pred_ret_1d"]) == np.sign(b["pred_ret_1d"])) * 100),
++        "agree_h": float(np.mean(np.sign(a[h]) == np.sign(b[h])) * 100),
++        "corr_h": float(np.corrcoef(a[h], b[h])[0, 1]),
++        "gap_end": float((lstm.future["pred"].iloc[-1] / reg.future["pred"].iloc[-1] - 1) * 100),
++    }
+-- 
+2.43.0
+
