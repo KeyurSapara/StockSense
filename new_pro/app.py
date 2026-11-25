@@ -57,11 +57,26 @@ def get_info(ticker):
     return predictor.load_info(ticker)
 
 
-@st.cache_resource(ttl=3600, show_spinner=False, max_entries=20)
-def get_forecast(ticker, horizon, _progress=None):
+@st.cache_resource(show_spinner=False)
+def _forecast_store():
+    # Shared {(ticker, horizon): (timestamp, result)} store. Training runs outside any
+    # @st.cache_* function so it can drive a progress bar created in the page body
+    # (Streamlit can't replay element calls on blocks created outside a cached function).
+    return {}
+
+
+def get_forecast(ticker, horizon, progress=None, ttl=3600, max_entries=20):
+    store = _forecast_store()
+    key = (ticker, horizon)
+    hit = store.get(key)
+    if hit and time.time() - hit[0] < ttl:
+        return hit[1]
     t0 = time.perf_counter()
-    res = predictor.train_and_forecast(get_prices(ticker), horizon=horizon, progress=_progress)
+    res = predictor.train_and_forecast(get_prices(ticker), horizon=horizon, progress=progress)
     res.extras["train_seconds"] = time.perf_counter() - t0
+    store[key] = (time.time(), res)
+    while len(store) > max_entries:
+        store.pop(min(store, key=lambda k: store[k][0]))
     return res
 
 
@@ -131,7 +146,7 @@ info = get_info(ticker)
 cur = CURRENCY.get(info["currency"], info["currency"] + " " if info["currency"] else "")
 bar = st.empty()
 res_lstm = get_forecast(ticker, horizon,
-                        _progress=lambda f: bar.progress(f, text=f"🧠 Training the neural network… {int(f * 100)}%"))
+                        progress=lambda f: bar.progress(f, text=f"🧠 Training the neural network… {int(f * 100)}%"))
 bar.empty()
 res_reg = get_regression(ticker, horizon)
 res = res_lstm if model_key == "lstm" else res_reg
