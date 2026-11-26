@@ -33,8 +33,10 @@ def load_prices(ticker: str, period: str = "5y") -> pd.DataFrame:
     df = yf.download(ticker, period=period, auto_adjust=True, progress=False)
     if df.empty:
         return df
+    # Yahoo Finance can return multi-level columns; keep only the OHLCV level.
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
+    # 5 original features
     df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
     df.index = pd.to_datetime(df.index).tz_localize(None)
     return df
@@ -56,6 +58,7 @@ def load_info(ticker: str) -> dict:
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     close = df["Close"]
+    # Bollinger bands measure price distance from its recent average.
     df["MA20"] = close.rolling(20).mean()
     df["MA50"] = close.rolling(50).mean()
     std20 = close.rolling(20).std()
@@ -65,15 +68,30 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     delta = close.diff()
     gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
     loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+    # RSI shows whether recent price movement has become overbought or oversold.
     df["RSI"] = 100 - 100 / (1 + gain / loss.replace(0, np.nan))
 
     # Model features (all scale-free so the same model works for any price level)
+    # return price from yesterday to today
     df["ret"] = np.log(close).diff() * 100
+    
+    # %dis from 20% moving avg 
     df["ma20_gap"] = (close / df["MA20"] - 1) * 100
+    
+    # %dis from 50% moving avg
     df["ma50_gap"] = (close / df["MA50"] - 1) * 100
+
+    # rescaling momentum indicator popular or based on volume
+    # relative strength index
     df["rsi"] = df["RSI"] / 100 - 0.5
+
+    # diff from normal price
     df["bb_pos"] = (close - df["MA20"]) / (2 * std20)
+
+    # people are buying or selling
     df["vol_chg"] = np.log(df["Volume"].replace(0, np.nan)).diff().clip(-3, 3)
+
+    # sudden change
     df["volatility"] = df["ret"].rolling(20).std()
     return df.replace([np.inf, -np.inf], np.nan).dropna()
 
@@ -89,6 +107,7 @@ class LSTMForecaster(nn.Module):
         self.head = nn.Sequential(nn.Dropout(0.2), nn.Linear(hidden, 64), nn.GELU(), nn.Linear(64, horizon))
 
     def forward(self, x):
+        # Use the final sequence state to predict every horizon step at once.
         out, _ = self.lstm(x)
         return self.head(out[:, -1])
 
@@ -103,7 +122,7 @@ class ForecastResult:
     model: str = "lstm"
     extras: dict = field(default_factory=dict)   # model-specific details (e.g. ridge coefficients)
 
-
+# Create 60-day sequences for 7-, 14-, or 30-day forecasts.
 def _windows(feats: np.ndarray, close: np.ndarray, lookback: int, horizon: int):
     X, Y, idx = [], [], []
     for t in range(lookback - 1, len(feats) - horizon):
@@ -119,6 +138,7 @@ def _prepare(df: pd.DataFrame, horizon: int, lookback: int, test_frac: float):
     close = data["Close"].to_numpy()
     raw = data[FEATURES].to_numpy(dtype=np.float32)
     X, Y, idx = _windows(raw, close, lookback, horizon)
+    # Keep the newest observations unseen for backtesting.
     split = int(len(X) * (1 - test_frac))
     # Standardise with statistics from the training period only (no leakage)
     train_rows = raw[: idx[split - 1] + 1]
@@ -132,6 +152,7 @@ def _build_result(df, data, close, idx, split, Y, pred_te, pred_future, horizon,
 
     # ---- Test-period evaluation (1-day-ahead) -------------------------------
     te_idx = idx[split:]
+    # Convert each test return back into a next-day predicted price.
     base = close[te_idx]
     actual = close[te_idx + 1]
     predicted = base * np.exp(pred_te[:, 0] / 100)
@@ -157,6 +178,7 @@ def _build_result(df, data, close, idx, split, Y, pred_te, pred_future, horizon,
     # ---- Future forecast with error bands from test residuals ---------------
     resid_sd = (Yte - pred_te).std(0)  # per-horizon spread in % log-return
     last_close = close[-1]
+    # Stocks use weekdays; cryptocurrencies also trade on weekends.
     is_crypto = "-" in str(df.attrs.get("ticker", ""))
     freq = "D" if is_crypto else "B"
     dates = pd.date_range(data.index[-1], periods=horizon + 1, freq=freq)[1:]

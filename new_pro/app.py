@@ -68,6 +68,7 @@ def get_forecast(ticker, horizon, progress=None, ttl=3600, max_entries=20):
     store = _forecast_store()
     key = (ticker, horizon)
     hit = store.get(key)
+    # Reuse recent results to avoid retraining for every Streamlit refresh.
     if hit and time.time() - hit[0] < ttl:
         return hit[1]
     t0 = time.perf_counter()
@@ -124,6 +125,7 @@ for col, (label, sym) in zip(cols, POPULAR.items()):
 c1, c2, c3 = st.columns([3, 2, 2])
 typed = c1.text_input("Or type any ticker", value=st.session_state.ticker,
                       help="Yahoo Finance symbols: AAPL, MSFT, INFY.NS (NSE India), ETH-USD …")
+# Let users choose how far ahead and which model leads the display.
 horizon = c2.select_slider("Forecast horizon", options=[7, 14, 30], value=14,
                            format_func=lambda d: f"{d} days")
 model_key = c3.radio("Headline model", list(MODELS), format_func=lambda k: MODELS[k][0], horizontal=True,
@@ -138,6 +140,7 @@ if not ticker:
 with st.spinner(f"Fetching {ticker}…"):
     prices = get_prices(ticker)
 if prices.empty or len(prices) < 300:
+    # A short history cannot provide enough windows for reliable training.
     st.error(f"Couldn't find enough data for **{ticker}**. Check the symbol (Indian stocks need `.NS`, e.g. `TCS.NS`).")
     st.stop()
 
@@ -152,6 +155,7 @@ res = res_lstm if model_key == "lstm" else res_reg
 other = res_reg if model_key == "lstm" else res_lstm
 MODEL_NAME, MODEL_COLOR = MODELS[res.model]
 OTHER_NAME, OTHER_COLOR = MODELS[other.model]
+# Format prices using the ticker's Yahoo Finance currency.
 fmt = lambda v: f"{cur}{v:,.2f}"
 
 # ---------------------------------------------------------------------------
@@ -160,6 +164,7 @@ fmt = lambda v: f"{cur}{v:,.2f}"
 
 last = float(prices["Close"].iloc[-1])
 prev = float(prices["Close"].iloc[-2])
+# Compare the latest close with the previous close for a daily change card.
 day_chg = (last / prev - 1) * 100
 target = float(res.future["pred"].iloc[-1])
 lo, hi = float(res.future["low"].iloc[-1]), float(res.future["high"].iloc[-1])
@@ -202,6 +207,7 @@ tab_fc, tab_ind, tab_model, tab_cmp, tab_data = st.tabs(
 with tab_fc:
     r1, r2 = st.columns([3, 2])
     rng = r1.radio("Show history", ["3M", "6M", "1Y", "All"], index=1, horizontal=True, label_visibility="collapsed")
+    # The second model remains visible for quick comparison when enabled.
     overlay = r2.toggle(f"Overlay {OTHER_NAME} forecast", value=True)
     days = {"3M": 63, "6M": 126, "1Y": 252, "All": len(prices)}[rng]
     h = res.history.tail(days)
@@ -226,6 +232,7 @@ with tab_fc:
 
 with tab_ind:
     h = res.history.tail(252)
+    # Plot Bollinger bands and moving averages, followed by RSI below.
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3], vertical_spacing=0.04)
     fig.add_scatter(x=h.index, y=h["BB_up"], line=dict(width=0), showlegend=False, hoverinfo="skip", row=1, col=1)
     fig.add_scatter(x=h.index, y=h["BB_low"], fill="tonexty", fillcolor="rgba(37,99,235,0.08)",
@@ -248,6 +255,7 @@ with tab_ind:
            f"{'up' if trend == 'above' else 'down'}.")
 
 with tab_model:
+    # Naive next-day MAE shows whether the model improves on copying today's price.
     beats = m["mae"] < m["naive_mae"]
     st.markdown(
         f"The model was trained on the first **{m['n_train']}** days and tested on the last **{m['n_test']}** days "
